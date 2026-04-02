@@ -1,347 +1,614 @@
 'use strict';
 
-// --- Data Layer ---
-const STORAGE_KEY = 'cowork_tasks';
+// --- Settings ---
+const SETTINGS_KEY = 'claude_chat_settings';
+const HISTORY_KEY = 'claude_chat_history';
 
-function loadTasks() {
+function loadSettings() {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
+    return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+  } catch { return {}; }
+}
+
+function saveSettings(s) {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+}
+
+function loadHistory() {
+  try {
+    return JSON.parse(localStorage.getItem(HISTORY_KEY)) || [];
   } catch { return []; }
 }
 
-function saveTasks(tasks) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
-}
-
-let tasks = loadTasks();
-let currentFilter = 'all';
-let editingId = null;
-
-// --- Sanitization ---
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
-}
-
-// Validate that a string looks like a UUID (防止注入)
-function isValidUUID(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
-}
-
-// Sanitize imported task data to only allow known safe fields
-function sanitizeTask(t) {
-  const allowedPriorities = ['high', 'medium', 'low'];
-  return {
-    id: (typeof t.id === 'string' && isValidUUID(t.id)) ? t.id : crypto.randomUUID(),
-    title: typeof t.title === 'string' ? t.title.slice(0, 500) : '',
-    description: typeof t.description === 'string' ? t.description.slice(0, 2000) : '',
-    priority: allowedPriorities.includes(t.priority) ? t.priority : 'medium',
-    category: typeof t.category === 'string' ? t.category.slice(0, 100) : '',
-    completed: t.completed === true,
-    completedAt: typeof t.completedAt === 'string' ? t.completedAt : null,
-    createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString(),
-  };
-}
-
-// --- Rendering ---
-function render() {
-  const list = document.getElementById('task-list');
-  const filtered = filterTasks(tasks, currentFilter);
-
-  // Stats
-  const active = tasks.filter(t => !t.completed).length;
-  const done = tasks.filter(t => t.completed).length;
-  document.getElementById('stat-active').textContent = active;
-  document.getElementById('stat-total').textContent = tasks.length;
-  document.getElementById('stat-done').textContent = done;
-
-  if (filtered.length === 0) {
-    list.innerHTML = '';
-    const empty = document.createElement('div');
-    empty.className = 'empty-state';
-    const icon = document.createElement('div');
-    icon.className = 'icon';
-    icon.textContent = currentFilter === 'all' ? '\u{1F4CB}' : '\u{1F50D}';
-    const p = document.createElement('p');
-    p.innerHTML = currentFilter === 'all'
-      ? 'No tasks yet.<br>Tap + to add your first task.'
-      : 'No tasks match this filter.';
-    empty.appendChild(icon);
-    empty.appendChild(p);
-    list.appendChild(empty);
-    return;
-  }
-
-  // Sort: incomplete first (high > medium > low), then completed
-  const priorityOrder = { high: 0, medium: 1, low: 2 };
-  const sorted = [...filtered].sort((a, b) => {
-    if (a.completed !== b.completed) return a.completed ? 1 : -1;
-    if (a.completed) return new Date(b.completedAt) - new Date(a.completedAt);
-    const pd = (priorityOrder[a.priority] || 1) - (priorityOrder[b.priority] || 1);
-    if (pd !== 0) return pd;
-    return new Date(b.createdAt) - new Date(a.createdAt);
-  });
-
-  // Build DOM nodes instead of innerHTML to prevent XSS
-  list.innerHTML = '';
-  let lastGroup = null;
-  for (const task of sorted) {
-    const group = task.completed ? 'Completed' : 'Active';
-    if (group !== lastGroup) {
-      const label = document.createElement('div');
-      label.className = 'task-group-label';
-      label.textContent = group;
-      list.appendChild(label);
-      lastGroup = group;
+function saveHistory(h) {
+  // Strip binary file data before persisting — only store text content
+  const safe = h.map(msg => {
+    if (msg._storable) return msg._storable;
+    if (msg.role === 'assistant') return { role: 'assistant', content: typeof msg.content === 'string' ? msg.content : '' };
+    // Fallback: strip non-text content
+    if (Array.isArray(msg.content)) {
+      const textParts = msg.content.filter(p => p.type === 'text');
+      return { role: msg.role, content: textParts.length === 1 ? textParts[0].text : textParts };
     }
-    list.appendChild(buildTaskCard(task));
-  }
+    return { role: msg.role, content: msg.content };
+  });
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(safe));
 }
 
-function buildTaskCard(task) {
-  const card = document.createElement('div');
-  card.className = 'task-card' + (task.completed ? ' completed' : '');
-  card.dataset.id = task.id;
+let settings = loadSettings();
+let conversationHistory = loadHistory();
+let pendingFiles = [];
+let isStreaming = false;
+let abortController = null;
 
-  const header = document.createElement('div');
-  header.className = 'task-header';
+// --- File Reading ---
 
-  // Checkbox
-  const checkbox = document.createElement('div');
-  checkbox.className = 'task-checkbox';
-  checkbox.addEventListener('click', (e) => {
-    e.stopPropagation();
-    toggleTask(task.id);
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
+
+const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+const PDF_TYPE = 'application/pdf';
+
+function readFileAsContent(file) {
+  return new Promise((resolve, reject) => {
+    if (IMAGE_TYPES.includes(file.type)) {
+      // Read images as base64 for the vision API
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64 = reader.result.split(',')[1];
+        resolve({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: file.type,
+            data: base64,
+          },
+        });
+      };
+      reader.onerror = () => reject(new Error('Failed to read image: ' + file.name));
+      reader.readAsDataURL(file);
+    } else if (file.type === PDF_TYPE) {
+      // Read PDFs as base64 document
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64 = reader.result.split(',')[1];
+        resolve({
+          type: 'document',
+          source: {
+            type: 'base64',
+            media_type: 'application/pdf',
+            data: base64,
+          },
+        });
+      };
+      reader.onerror = () => reject(new Error('Failed to read PDF: ' + file.name));
+      reader.readAsDataURL(file);
+    } else {
+      // Read everything else as text
+      const reader = new FileReader();
+      reader.onload = () => {
+        resolve({
+          type: 'text',
+          text: `--- File: ${file.name} (${formatFileSize(file.size)}) ---\n${reader.result}`,
+        });
+      };
+      reader.onerror = () => reject(new Error('Failed to read file: ' + file.name));
+      reader.readAsText(file);
+    }
+  });
+}
+
+// --- Markdown Rendering (lightweight) ---
+
+function renderMarkdown(text) {
+  // Escape HTML
+  let html = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // Code blocks
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    return '<pre><code>' + code.trimEnd() + '</code></pre>';
   });
 
-  // Content area
-  const content = document.createElement('div');
-  content.className = 'task-content';
-  content.addEventListener('click', () => openEditModal(task.id));
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
 
-  const title = document.createElement('div');
-  title.className = 'task-title';
-  title.textContent = task.title;
-  content.appendChild(title);
+  // Bold
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
 
-  if (task.description) {
-    const desc = document.createElement('div');
-    desc.className = 'task-description';
-    desc.textContent = task.description;
-    content.appendChild(desc);
+  // Italic
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+  // Headers
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+
+  // Unordered lists
+  html = html.replace(/^[*-] (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+
+  // Paragraphs - split by double newlines
+  html = html.replace(/\n\n+/g, '</p><p>');
+  html = '<p>' + html + '</p>';
+
+  // Clean up empty paragraphs and paragraphs around block elements
+  html = html.replace(/<p>\s*<\/p>/g, '');
+  html = html.replace(/<p>\s*(<pre>)/g, '$1');
+  html = html.replace(/(<\/pre>)\s*<\/p>/g, '$1');
+  html = html.replace(/<p>\s*(<h[123]>)/g, '$1');
+  html = html.replace(/(<\/h[123]>)\s*<\/p>/g, '$1');
+  html = html.replace(/<p>\s*(<ul>)/g, '$1');
+  html = html.replace(/(<\/ul>)\s*<\/p>/g, '$1');
+
+  // Line breaks within paragraphs
+  html = html.replace(/\n/g, '<br>');
+
+  return html;
+}
+
+// --- UI ---
+
+function scrollToBottom() {
+  const container = document.getElementById('chat-messages');
+  container.scrollTop = container.scrollHeight;
+}
+
+function addMessageToUI(role, text, files) {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const container = document.getElementById('chat-messages');
+  const msg = document.createElement('div');
+  msg.className = 'message ' + role;
+
+  const roleLabel = document.createElement('div');
+  roleLabel.className = 'message-role';
+  roleLabel.textContent = role === 'user' ? 'You' : 'Claude';
+  msg.appendChild(roleLabel);
+
+  if (files && files.length > 0) {
+    const filesDiv = document.createElement('div');
+    filesDiv.className = 'message-files';
+    for (const f of files) {
+      const tag = document.createElement('span');
+      tag.className = 'file-tag';
+      tag.innerHTML = '&#128196; ' + escapeForAttr(f.name) +
+        ' <span class="file-size">(' + formatFileSize(f.size) + ')</span>';
+      filesDiv.appendChild(tag);
+    }
+    msg.appendChild(filesDiv);
   }
 
-  // Meta row
-  const meta = document.createElement('div');
-  meta.className = 'task-meta';
+  const bubble = document.createElement('div');
+  bubble.className = 'message-bubble';
 
-  const priorityTag = document.createElement('span');
-  priorityTag.className = 'tag priority-' + task.priority;
-  priorityTag.textContent = task.priority;
-  meta.appendChild(priorityTag);
-
-  if (task.category) {
-    const catTag = document.createElement('span');
-    catTag.className = 'tag category';
-    catTag.textContent = task.category;
-    meta.appendChild(catTag);
-  }
-
-  const dateEl = document.createElement('span');
-  dateEl.className = 'task-date';
-  dateEl.textContent = new Date(task.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  meta.appendChild(dateEl);
-
-  content.appendChild(meta);
-  header.appendChild(checkbox);
-  header.appendChild(content);
-  card.appendChild(header);
-  return card;
-}
-
-function filterTasks(tasks, filter) {
-  switch (filter) {
-    case 'active': return tasks.filter(t => !t.completed);
-    case 'completed': return tasks.filter(t => t.completed);
-    case 'high': return tasks.filter(t => t.priority === 'high' && !t.completed);
-    case 'medium': return tasks.filter(t => t.priority === 'medium' && !t.completed);
-    case 'low': return tasks.filter(t => t.priority === 'low' && !t.completed);
-    default: return tasks;
-  }
-}
-
-// --- Actions ---
-function toggleTask(id) {
-  if (!isValidUUID(id)) return;
-  const task = tasks.find(t => t.id === id);
-  if (!task) return;
-  task.completed = !task.completed;
-  task.completedAt = task.completed ? new Date().toISOString() : null;
-  saveTasks(tasks);
-  render();
-}
-
-function openTaskModal() {
-  editingId = null;
-  document.getElementById('modal-title').textContent = 'New Task';
-  document.getElementById('save-btn').textContent = 'Add Task';
-  document.getElementById('delete-btn').classList.add('hidden');
-  document.getElementById('task-form').reset();
-  document.getElementById('task-id').value = '';
-  document.getElementById('task-modal').classList.add('open');
-}
-
-function openEditModal(id) {
-  if (!isValidUUID(id)) return;
-  const task = tasks.find(t => t.id === id);
-  if (!task) return;
-  editingId = id;
-  document.getElementById('modal-title').textContent = 'Edit Task';
-  document.getElementById('save-btn').textContent = 'Save Changes';
-  document.getElementById('delete-btn').classList.remove('hidden');
-  document.getElementById('task-id').value = id;
-  document.getElementById('task-title-input').value = task.title;
-  document.getElementById('task-desc').value = task.description || '';
-  document.getElementById('task-priority').value = task.priority;
-  document.getElementById('task-category').value = task.category || '';
-  document.getElementById('task-modal').classList.add('open');
-}
-
-function saveTask(e) {
-  e.preventDefault();
-  const title = document.getElementById('task-title-input').value.trim();
-  if (!title) return;
-
-  const allowedPriorities = ['high', 'medium', 'low'];
-  const rawPriority = document.getElementById('task-priority').value;
-
-  const data = {
-    title: title.slice(0, 500),
-    description: document.getElementById('task-desc').value.trim().slice(0, 2000),
-    priority: allowedPriorities.includes(rawPriority) ? rawPriority : 'medium',
-    category: document.getElementById('task-category').value.trim().slice(0, 100),
-  };
-
-  if (editingId) {
-    const task = tasks.find(t => t.id === editingId);
-    if (task) Object.assign(task, data);
+  if (role === 'assistant') {
+    bubble.innerHTML = renderMarkdown(text);
   } else {
-    tasks.push({
-      id: crypto.randomUUID(),
-      ...data,
-      completed: false,
-      completedAt: null,
-      createdAt: new Date().toISOString(),
-    });
+    bubble.textContent = text;
   }
 
-  saveTasks(tasks);
-  closeModals();
-  render();
-  showToast(editingId ? 'Task updated' : 'Task added');
+  msg.appendChild(bubble);
+  container.appendChild(msg);
+  scrollToBottom();
+  return bubble;
 }
 
-function deleteTask() {
-  if (!editingId) return;
-  tasks = tasks.filter(t => t.id !== editingId);
-  saveTasks(tasks);
-  closeModals();
-  render();
-  showToast('Task deleted');
+function addStreamingMessage() {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const container = document.getElementById('chat-messages');
+  const msg = document.createElement('div');
+  msg.className = 'message assistant';
+  msg.id = 'streaming-msg';
+
+  const roleLabel = document.createElement('div');
+  roleLabel.className = 'message-role';
+  roleLabel.textContent = 'Claude';
+  msg.appendChild(roleLabel);
+
+  const bubble = document.createElement('div');
+  bubble.className = 'message-bubble';
+  bubble.id = 'streaming-bubble';
+  bubble.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+  msg.appendChild(bubble);
+
+  container.appendChild(msg);
+  scrollToBottom();
+  return bubble;
 }
 
-function closeModals() {
-  document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('open'));
-  editingId = null;
+function updateStreamingMessage(text) {
+  const bubble = document.getElementById('streaming-bubble');
+  if (!bubble) return;
+  bubble.innerHTML = renderMarkdown(text);
+  scrollToBottom();
 }
 
-// --- Sync ---
-function openSyncModal() {
-  document.getElementById('sync-data').value = '';
-  document.getElementById('sync-modal').classList.add('open');
+function finalizeStreamingMessage(text) {
+  const bubble = document.getElementById('streaming-bubble');
+  if (bubble) {
+    bubble.innerHTML = renderMarkdown(text);
+    bubble.removeAttribute('id');
+  }
+  const msg = document.getElementById('streaming-msg');
+  if (msg) msg.removeAttribute('id');
+  scrollToBottom();
 }
 
-function exportTasks() {
-  const json = JSON.stringify(tasks, null, 2);
-  document.getElementById('sync-data').value = json;
-  navigator.clipboard.writeText(json).then(() => {
-    showToast('Copied to clipboard');
-  }).catch(() => {
-    showToast('Exported below \u2014 copy manually');
-  });
+function addErrorMessage(text) {
+  const container = document.getElementById('chat-messages');
+  const msg = document.createElement('div');
+  msg.className = 'message error';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'message-bubble';
+  bubble.textContent = text;
+  msg.appendChild(bubble);
+
+  container.appendChild(msg);
+  scrollToBottom();
 }
 
-function importTasks() {
-  const raw = document.getElementById('sync-data').value.trim();
-  if (!raw) { showToast('Paste JSON first'); return; }
+function escapeForAttr(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 
-  // Limit import size to prevent DoS
-  if (raw.length > 1_000_000) {
-    showToast('Import data too large');
+// --- File Preview Bar ---
+
+function updateFilePreview() {
+  const bar = document.getElementById('file-preview-bar');
+  bar.innerHTML = '';
+
+  if (pendingFiles.length === 0) {
+    bar.classList.remove('has-files');
     return;
   }
+
+  bar.classList.add('has-files');
+  pendingFiles.forEach((file, i) => {
+    const item = document.createElement('div');
+    item.className = 'file-preview-item';
+
+    const name = document.createElement('span');
+    name.textContent = file.name + ' (' + formatFileSize(file.size) + ')';
+    item.appendChild(name);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'remove-file';
+    removeBtn.textContent = '\u00d7';
+    removeBtn.addEventListener('click', () => {
+      pendingFiles.splice(i, 1);
+      updateFilePreview();
+      updateSendButton();
+    });
+    item.appendChild(removeBtn);
+
+    bar.appendChild(item);
+  });
+}
+
+// --- API Call ---
+
+async function sendMessage() {
+  const input = document.getElementById('message-input');
+  const text = input.value.trim();
+
+  if (!text && pendingFiles.length === 0) return;
+  if (isStreaming) return;
+
+  const apiKey = settings.apiKey;
+  if (!apiKey) {
+    showToast('Set your API key in Settings first');
+    document.getElementById('settings-modal').classList.add('open');
+    return;
+  }
+
+  const model = settings.model || 'claude-sonnet-4-20250514';
+  const maxTokens = settings.maxTokens || 8192;
+
+  // Build content array for the user message
+  const contentParts = [];
+  const filesMeta = pendingFiles.map(f => ({ name: f.name, size: f.size }));
+
+  // Read all files
+  if (pendingFiles.length > 0) {
+    try {
+      const fileContents = await Promise.all(pendingFiles.map(readFileAsContent));
+      contentParts.push(...fileContents);
+    } catch (err) {
+      addErrorMessage('Error reading files: ' + err.message);
+      return;
+    }
+  }
+
+  // Add text
+  if (text) {
+    contentParts.push({ type: 'text', text: text });
+  }
+
+  // Show user message in UI
+  addMessageToUI('user', text, filesMeta);
+
+  // Add to conversation history
+  // For API: send full content including files
+  // For localStorage: only store text parts (files are ephemeral to protect privacy)
+  const userMessage = { role: 'user', content: contentParts.length === 1 && contentParts[0].type === 'text' ? text : contentParts };
+  conversationHistory.push(userMessage);
+
+  // Build a storage-safe version that strips file binary data
+  const storableParts = contentParts.filter(p => p.type === 'text');
+  const storableMessage = { role: 'user', content: storableParts.length === 1 ? storableParts[0].text : storableParts };
+  // We'll use _storable on the message to know what to persist
+  userMessage._storable = storableMessage;
+
+  // Clear input and files
+  input.value = '';
+  input.style.height = 'auto';
+  pendingFiles = [];
+  updateFilePreview();
+  updateSendButton();
+
+  // Start streaming
+  isStreaming = true;
+  updateSendButton();
+  addStreamingMessage();
+
+  abortController = new AbortController();
 
   try {
-    const imported = JSON.parse(raw);
-    if (!Array.isArray(imported)) throw new Error('Not an array');
-    if (imported.length > 10_000) throw new Error('Too many tasks');
+    const body = {
+      model: model,
+      max_tokens: maxTokens,
+      messages: conversationHistory,
+      stream: true,
+    };
 
-    const existing = new Set(tasks.map(t => t.title + '|' + t.createdAt));
-    let added = 0;
-    for (const t of imported) {
-      const sanitized = sanitizeTask(t);
-      if (!sanitized.title) continue;
-      const key = sanitized.title + '|' + sanitized.createdAt;
-      if (!existing.has(key)) {
-        tasks.push(sanitized);
-        existing.add(key);
-        added++;
+    if (settings.systemPrompt) {
+      body.system = settings.systemPrompt;
+    }
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify(body),
+      signal: abortController.signal,
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      let errMsg;
+      try {
+        const errJson = JSON.parse(errBody);
+        errMsg = errJson.error?.message || errBody;
+      } catch {
+        errMsg = errBody;
+      }
+      throw new Error(`API error ${response.status}: ${errMsg}`);
+    }
+
+    // Read SSE stream
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+
+        try {
+          const event = JSON.parse(data);
+
+          if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+            fullText += event.delta.text;
+            updateStreamingMessage(fullText);
+          }
+
+          if (event.type === 'message_stop') {
+            break;
+          }
+
+          if (event.type === 'error') {
+            throw new Error(event.error?.message || 'Stream error');
+          }
+        } catch (e) {
+          if (e.message.startsWith('API error') || e.message === 'Stream error') throw e;
+          // Ignore JSON parse errors for non-data lines
+        }
       }
     }
-    saveTasks(tasks);
-    closeModals();
-    render();
-    showToast(`Imported ${added} task${added !== 1 ? 's' : ''}`);
+
+    finalizeStreamingMessage(fullText);
+
+    // Save assistant message to history
+    conversationHistory.push({ role: 'assistant', content: fullText });
+    saveHistory(conversationHistory);
+
   } catch (err) {
-    showToast('Invalid JSON format');
+    if (err.name === 'AbortError') {
+      finalizeStreamingMessage('*(Message cancelled)*');
+    } else {
+      // Remove streaming message
+      const streamMsg = document.getElementById('streaming-msg');
+      if (streamMsg) streamMsg.remove();
+      addErrorMessage(err.message);
+      // Remove the user message from history since it failed
+      conversationHistory.pop();
+    }
+  } finally {
+    isStreaming = false;
+    abortController = null;
+    updateSendButton();
+  }
+}
+
+// --- New Chat ---
+
+function newChat() {
+  conversationHistory = [];
+  saveHistory(conversationHistory);
+
+  const container = document.getElementById('chat-messages');
+  container.innerHTML = '';
+
+  const welcome = document.createElement('div');
+  welcome.className = 'welcome-state';
+  welcome.id = 'welcome';
+  welcome.innerHTML = '<div class="welcome-icon">&#9993;</div>' +
+    '<h2>Chat with Claude</h2>' +
+    '<p>Upload files of any size. Text files are sent as content, images as base64. No upload limits.</p>';
+  container.appendChild(welcome);
+
+  pendingFiles = [];
+  updateFilePreview();
+}
+
+// --- Restore chat history on load ---
+
+function restoreHistory() {
+  if (conversationHistory.length === 0) return;
+
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  for (const msg of conversationHistory) {
+    if (msg.role === 'user') {
+      // Extract text from content
+      let text = '';
+      if (typeof msg.content === 'string') {
+        text = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        text = msg.content
+          .filter(p => p.type === 'text')
+          .map(p => p.text)
+          .join('\n');
+      }
+      addMessageToUI('user', text, []);
+    } else if (msg.role === 'assistant') {
+      const text = typeof msg.content === 'string' ? msg.content : '';
+      addMessageToUI('assistant', text, []);
+    }
   }
 }
 
 // --- Toast ---
+
 function showToast(msg) {
   const toast = document.getElementById('toast');
   toast.textContent = msg;
   toast.classList.add('show');
-  setTimeout(() => toast.classList.remove('show'), 2000);
+  setTimeout(() => toast.classList.remove('show'), 2500);
 }
 
-// --- Event Listeners (no inline handlers) ---
+// --- Send Button State ---
+
+function updateSendButton() {
+  const input = document.getElementById('message-input');
+  const btn = document.getElementById('send-btn');
+  const hasContent = input.value.trim().length > 0 || pendingFiles.length > 0;
+  btn.disabled = !hasContent || isStreaming;
+}
+
+// --- Settings Modal ---
+
+function openSettings() {
+  document.getElementById('api-key-input').value = settings.apiKey || '';
+  document.getElementById('model-select').value = settings.model || 'claude-sonnet-4-20250514';
+  document.getElementById('max-tokens-input').value = settings.maxTokens || 8192;
+  document.getElementById('system-prompt-input').value = settings.systemPrompt || '';
+  document.getElementById('settings-modal').classList.add('open');
+}
+
+function saveSettingsForm(e) {
+  e.preventDefault();
+  settings.apiKey = document.getElementById('api-key-input').value.trim();
+  settings.model = document.getElementById('model-select').value;
+  settings.maxTokens = parseInt(document.getElementById('max-tokens-input').value) || 8192;
+  settings.systemPrompt = document.getElementById('system-prompt-input').value.trim();
+  saveSettings(settings);
+  document.getElementById('model-indicator').textContent = settings.model;
+  closeModals();
+  showToast('Settings saved');
+}
+
+function closeModals() {
+  document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('open'));
+}
+
+// --- Event Listeners ---
+
 document.addEventListener('DOMContentLoaded', () => {
-  // Filter tabs
-  document.getElementById('filters').addEventListener('click', (e) => {
-    if (!e.target.classList.contains('filter-btn')) return;
-    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-    e.target.classList.add('active');
-    currentFilter = e.target.dataset.filter;
-    render();
+  // Settings
+  document.getElementById('settings-btn').addEventListener('click', openSettings);
+  document.getElementById('settings-form').addEventListener('submit', saveSettingsForm);
+
+  // Clear all data
+  document.getElementById('clear-data-btn').addEventListener('click', () => {
+    if (confirm('This will delete your API key, chat history, and all settings. Continue?')) {
+      localStorage.removeItem(SETTINGS_KEY);
+      localStorage.removeItem(HISTORY_KEY);
+      settings = {};
+      conversationHistory = [];
+      pendingFiles = [];
+      closeModals();
+      newChat();
+      showToast('All data cleared');
+    }
   });
 
-  // FAB button
-  document.querySelector('.fab').addEventListener('click', openTaskModal);
+  // New chat
+  document.getElementById('new-chat-btn').addEventListener('click', newChat);
 
-  // Sync button
-  document.querySelector('[data-action="sync"]').addEventListener('click', openSyncModal);
+  // File input
+  document.getElementById('file-input').addEventListener('change', (e) => {
+    const files = Array.from(e.target.files);
+    pendingFiles.push(...files);
+    updateFilePreview();
+    updateSendButton();
+    e.target.value = '';
+  });
 
-  // Task form submit
-  document.getElementById('task-form').addEventListener('submit', saveTask);
+  // Message input auto-resize
+  const msgInput = document.getElementById('message-input');
+  msgInput.addEventListener('input', () => {
+    msgInput.style.height = 'auto';
+    msgInput.style.height = Math.min(msgInput.scrollHeight, 160) + 'px';
+    updateSendButton();
+  });
 
-  // Delete button
-  document.getElementById('delete-btn').addEventListener('click', deleteTask);
+  // Send on Enter (Shift+Enter for newline)
+  msgInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
 
-  // Export / Import buttons
-  document.querySelector('[data-action="export"]').addEventListener('click', exportTasks);
-  document.querySelector('[data-action="import"]').addEventListener('click', importTasks);
+  // Send button
+  document.getElementById('send-btn').addEventListener('click', sendMessage);
 
   // Close modals on overlay tap
   document.querySelectorAll('.modal-overlay').forEach(overlay => {
@@ -350,11 +617,32 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
+  // Drag and drop files
+  const chatArea = document.getElementById('chat-messages');
+  chatArea.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  chatArea.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length > 0) {
+      pendingFiles.push(...files);
+      updateFilePreview();
+      updateSendButton();
+    }
+  });
+
+  // Update model indicator
+  if (settings.model) {
+    document.getElementById('model-indicator').textContent = settings.model;
+  }
+
+  // Restore history
+  restoreHistory();
+
   // Service Worker
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
-
-  // Initial render
-  render();
 });

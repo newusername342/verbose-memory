@@ -1,7 +1,7 @@
 {
-  "name": "Cowork Tasks",
-  "short_name": "Cowork",
-  "description": "Mobile task manager for Claude Cowork tasks",
+  "name": "Claude Chat - Unlimited Uploads",
+  "short_name": "Claude Chat",
+  "description": "Privacy-first Claude chat with unlimited file uploads",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
