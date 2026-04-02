@@ -16,7 +16,12 @@ function saveSettings(s) {
 
 function loadHistory() {
   try {
-    return JSON.parse(localStorage.getItem(HISTORY_KEY)) || [];
+    const raw = JSON.parse(localStorage.getItem(HISTORY_KEY)) || [];
+    // Clean any corrupted messages (e.g. leftover _storable fields)
+    return raw.map(msg => {
+      const clean = { role: msg.role, content: msg.content };
+      return clean;
+    }).filter(msg => msg.role && msg.content);
   } catch { return []; }
 }
 
