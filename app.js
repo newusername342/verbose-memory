@@ -23,7 +23,8 @@ function loadHistory() {
 function saveHistory(h) {
   // Strip binary file data before persisting — only store text content
   const safe = h.map(msg => {
-    if (msg._storable) return msg._storable;
+    const storable = storableMessages.get(msg);
+    if (storable) return storable;
     if (msg.role === 'assistant') return { role: 'assistant', content: typeof msg.content === 'string' ? msg.content : '' };
     // Fallback: strip non-text content
     if (Array.isArray(msg.content)) {
@@ -40,6 +41,7 @@ let conversationHistory = loadHistory();
 let pendingFiles = [];
 let isStreaming = false;
 let abortController = null;
+let storableMessages = new Map();
 
 // --- File Reading ---
 
@@ -347,8 +349,7 @@ async function sendMessage() {
   // Build a storage-safe version that strips file binary data
   const storableParts = contentParts.filter(p => p.type === 'text');
   const storableMessage = { role: 'user', content: storableParts.length === 1 ? storableParts[0].text : storableParts };
-  // We'll use _storable on the message to know what to persist
-  userMessage._storable = storableMessage;
+  storableMessages.set(userMessage, storableMessage);
 
   // Clear input and files
   input.value = '';
