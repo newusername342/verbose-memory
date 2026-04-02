@@ -371,10 +371,13 @@ async function sendMessage() {
   abortController = new AbortController();
 
   try {
+    // Sanitize messages: only send role + content to the API
+    const cleanMessages = conversationHistory.map(m => ({ role: m.role, content: m.content }));
+
     const body = {
       model: model,
       max_tokens: maxTokens,
-      messages: conversationHistory,
+      messages: cleanMessages,
       stream: true,
     };
 
