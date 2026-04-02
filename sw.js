@@ -1,4 +1,4 @@
-const CACHE_NAME = 'claude-chat-v1';
+const CACHE_NAME = 'claude-chat-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -26,20 +26,20 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  // Only handle same-origin GET requests — never cache API calls
+  // Only handle same-origin GET requests — never touch API calls
   if (event.request.method !== 'GET') return;
   if (new URL(event.request.url).origin !== self.location.origin) return;
 
+  // Network-first strategy: always try network, fall back to cache for offline use
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request).then((response) => {
+    fetch(event.request)
+      .then((response) => {
         if (response.ok && response.type === 'basic') {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
         }
         return response;
-      });
-    })
+      })
+      .catch(() => caches.match(event.request))
   );
 });

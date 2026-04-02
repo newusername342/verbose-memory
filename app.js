@@ -14,29 +14,30 @@ function saveSettings(s) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
 }
 
+// Sanitize a message to only have role + content — nothing else
+function cleanMessage(msg) {
+  return { role: msg.role, content: msg.content };
+}
+
 function loadHistory() {
   try {
     const raw = JSON.parse(localStorage.getItem(HISTORY_KEY)) || [];
-    // Clean any corrupted messages (e.g. leftover _storable fields)
-    return raw.map(msg => {
-      const clean = { role: msg.role, content: msg.content };
-      return clean;
-    }).filter(msg => msg.role && msg.content);
+    return raw.map(cleanMessage).filter(msg => msg.role && msg.content);
   } catch { return []; }
 }
 
 function saveHistory(h) {
-  // Strip binary file data before persisting — only store text content
+  // Only store text content — strip binary file data (images, PDFs)
   const safe = h.map(msg => {
-    const storable = storableMessages.get(msg);
-    if (storable) return storable;
-    if (msg.role === 'assistant') return { role: 'assistant', content: typeof msg.content === 'string' ? msg.content : '' };
-    // Fallback: strip non-text content
+    if (msg.role === 'assistant') {
+      return { role: 'assistant', content: typeof msg.content === 'string' ? msg.content : '' };
+    }
+    // For user messages, strip non-text content parts (images, PDFs)
     if (Array.isArray(msg.content)) {
       const textParts = msg.content.filter(p => p.type === 'text');
       return { role: msg.role, content: textParts.length === 1 ? textParts[0].text : textParts };
     }
-    return { role: msg.role, content: msg.content };
+    return cleanMessage(msg);
   });
   localStorage.setItem(HISTORY_KEY, JSON.stringify(safe));
 }
@@ -46,7 +47,6 @@ let conversationHistory = loadHistory();
 let pendingFiles = [];
 let isStreaming = false;
 let abortController = null;
-let storableMessages = new Map();
 
 // --- File Reading ---
 
@@ -346,15 +346,8 @@ async function sendMessage() {
   addMessageToUI('user', text, filesMeta);
 
   // Add to conversation history
-  // For API: send full content including files
-  // For localStorage: only store text parts (files are ephemeral to protect privacy)
   const userMessage = { role: 'user', content: contentParts.length === 1 && contentParts[0].type === 'text' ? text : contentParts };
   conversationHistory.push(userMessage);
-
-  // Build a storage-safe version that strips file binary data
-  const storableParts = contentParts.filter(p => p.type === 'text');
-  const storableMessage = { role: 'user', content: storableParts.length === 1 ? storableParts[0].text : storableParts };
-  storableMessages.set(userMessage, storableMessage);
 
   // Clear input and files
   input.value = '';
@@ -371,10 +364,16 @@ async function sendMessage() {
   abortController = new AbortController();
 
   try {
+    // CRITICAL: Build a clean messages array with ONLY role + content.
+    // JSON.parse(JSON.stringify()) guarantees no extra properties survive.
+    const apiMessages = JSON.parse(JSON.stringify(
+      conversationHistory.map(cleanMessage)
+    ));
+
     const body = {
       model: model,
       max_tokens: maxTokens,
-      messages: conversationHistory,
+      messages: apiMessages,
       stream: true,
     };
 
@@ -647,8 +646,13 @@ document.addEventListener('DOMContentLoaded', () => {
   // Restore history
   restoreHistory();
 
-  // Service Worker
+  // Service Worker — unregister all old SWs first, then register fresh
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+    navigator.serviceWorker.getRegistrations().then((registrations) => {
+      const unregisterAll = registrations.map(r => r.unregister());
+      return Promise.all(unregisterAll);
+    }).then(() => {
+      return navigator.serviceWorker.register('sw.js');
+    }).catch(() => {});
   }
 });
