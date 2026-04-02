@@ -1,4 +1,4 @@
-const CACHE_NAME = 'cowork-tasks-v1';
+const CACHE_NAME = 'claude-chat-v1';
 const ASSETS = [
   './',
   './index.html',
@@ -26,16 +26,14 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  // Only handle same-origin GET requests
+  // Only handle same-origin GET requests — never cache API calls
   if (event.request.method !== 'GET') return;
   if (new URL(event.request.url).origin !== self.location.origin) return;
 
   event.respondWith(
     caches.match(event.request).then((cached) => {
-      // Cache-first, then network fallback
       if (cached) return cached;
       return fetch(event.request).then((response) => {
-        // Only cache successful same-origin responses
         if (response.ok && response.type === 'basic') {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
