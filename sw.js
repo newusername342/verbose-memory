@@ -1,4 +1,4 @@
-const CACHE_NAME = 'claude-chat-v1';
+const CACHE_NAME = 'claude-chat-v2';
 const ASSETS = [
   './',
   './index.html',
